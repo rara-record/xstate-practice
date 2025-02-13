@@ -21,16 +21,9 @@ const useTextEditor = () => {
   const isLoading = isSaving || isConnecting;
 
   // 상태 메시지 로직
-  const getStatusMessage = ({
-    isTyping,
-    isSaving,
-  }: {
-    isTyping: boolean;
-    isSaving: boolean;
-    isLoading: boolean;
-  }) => {
+  const getStatusMessage = ({ isTyping, isLoading }: { isTyping: boolean; isLoading: boolean }) => {
     if (isTyping) return '입력 중...';
-    if (isSaving) return '저장 중...';
+    if (isLoading) return '요청 처리중...';
     return '';
   };
 
@@ -61,7 +54,7 @@ const useTextEditor = () => {
     value,
     committedValue,
     error,
-    statusMessage: getStatusMessage({ isTyping, isSaving, isLoading }),
+    statusMessage: getStatusMessage({ isTyping, isLoading }),
     handleRetry: () => send({ type: 'text.retry' }),
   };
 };

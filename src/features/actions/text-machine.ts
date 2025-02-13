@@ -1,4 +1,4 @@
-import { setup, fromPromise, assign } from 'xstate';
+import { setup, fromPromise, assign, sendTo } from 'xstate';
 
 // 타입 정의
 // 상태 머신에서 사용할 컨텍스트와 이벤트 타입을 정의합니다.
@@ -6,7 +6,6 @@ type TextContext = {
   value: string;
   committedValue: string;
   error?: string;
-  shouldSave?: boolean;
 };
 
 type TextEvents =
@@ -38,150 +37,185 @@ const services = {
   },
 };
 
+// 공통 액터 정의
+const actors = {
+  connectWebSocket: fromPromise(async () => {
+    await services.connectWebSocket();
+  }),
+  saveText: fromPromise(async ({ input }: { input: { text: string } }) => {
+    const result = await services.saveText(input.text);
+    return result;
+  }),
+} as const;
+
+// 1. 웹소켓 연결 머신
+const connectionMachine = setup({
+  types: {} as {
+    context: { error?: string };
+    events: { type: 'text.focus' };
+  },
+  actors: {
+    connectWebSocket: actors.connectWebSocket,
+  },
+}).createMachine({
+  id: 'connection',
+  initial: 'disconnected',
+  context: { error: undefined },
+  states: {
+    disconnected: {
+      on: { 'text.focus': 'connecting' },
+    },
+    connecting: {
+      invoke: {
+        src: 'connectWebSocket',
+        onDone: 'connected',
+        onError: {
+          target: 'error',
+          actions: assign({
+            error: ({ event }) => event.error.message,
+          }),
+        },
+      },
+    },
+    connected: {},
+    error: {
+      on: { 'text.focus': 'connecting' },
+    },
+  },
+});
+
+// 2. 저장 머신
+const savingMachine = setup({
+  types: {} as {
+    context: { value: string; committedValue: string; error?: string };
+    events: { type: 'text.save'; value: string } | { type: 'text.retry' };
+  },
+  actors: {
+    saveText: actors.saveText,
+  },
+}).createMachine({
+  id: 'saving',
+  initial: 'idle',
+  context: {
+    value: '',
+    committedValue: '',
+  },
+  states: {
+    idle: {
+      always: {
+        target: 'saving',
+        guard: ({ context }) => context.value !== context.committedValue,
+      },
+    },
+    saving: {
+      invoke: {
+        src: 'saveText',
+        input: ({ context }) => ({
+          text: context.value,
+        }),
+        onDone: {
+          target: 'idle',
+          actions: assign({
+            committedValue: ({ event }) => event.output,
+            error: () => undefined,
+          }),
+        },
+        onError: {
+          target: 'error',
+          actions: assign({
+            error: ({ event }) => event.error.message,
+          }),
+        },
+      },
+    },
+    error: {
+      on: { 'text.retry': 'saving' },
+    },
+  },
+});
+
+// 3. 입력 머신
+const inputMachine = setup({
+  types: {} as {
+    context: { value: string };
+    events: { type: 'text.change'; value: string };
+  },
+}).createMachine({
+  id: 'input',
+  initial: 'idle',
+  context: { value: '' },
+  states: {
+    idle: {
+      on: {
+        'text.change': {
+          target: 'debouncing',
+          actions: assign({
+            value: ({ event }) => event.value,
+          }),
+        },
+      },
+    },
+    debouncing: {
+      on: {
+        'text.change': {
+          target: 'debouncing',
+          actions: assign({
+            value: ({ event }) => event.value,
+          }),
+          reenter: true,
+        },
+      },
+      after: {
+        500: [
+          {
+            target: 'idle',
+            guard: ({ context }) => context.value !== '',
+            actions: assign({
+              value: ({ context }) => context.value,
+            }),
+          },
+          {
+            target: 'idle',
+          },
+        ],
+      },
+    },
+  },
+});
+
+// 메인 머신
 export const textMachine = setup({
   types: {
     context: {} as TextContext,
     events: {} as TextEvents,
     output: {} as string,
   },
-  actors: {
-    // 웹소켓 연결 서비스
-    connectWebSocket: fromPromise(async () => {
-      await services.connectWebSocket();
-    }),
-    // 텍스트 저장 서비스
-    saveText: fromPromise(async ({ input }: { input: { text: string } }) => {
-      const result = await services.saveText(input.text);
-      return result;
-    }),
-  },
-  guards: {
-    // 입력 값이 변경되었는지 확인하는 가드
-    hasChanges: ({ context }) => context.value !== context.committedValue,
-    // 변경된 값이 있고 저장해야 하는지 확인하는 가드
-    shouldSaveChanges: ({ context }) =>
-      context.shouldSave === true && context.value !== context.committedValue,
-  },
+  actors,
 }).createMachine({
   id: 'textEditor',
   type: 'parallel',
   context: {
-    value: '', // 현재 입력 값
-    committedValue: '', // 저장된 값
-    shouldSave: false, // 저장 여부
+    value: '',
+    committedValue: '',
   },
   states: {
     input: {
       initial: 'idle',
-      states: {
-        idle: {
-          on: {
-            'text.change': {
-              target: 'debouncing',
-              actions: assign({
-                value: ({ event }) => event.value, // 입력 값을 업데이트
-                shouldSave: () => false, // 저장 플래그 초기화
-              }),
-            },
-          },
-        },
-        debouncing: {
-          on: {
-            'text.change': {
-              target: 'debouncing',
-              actions: assign({
-                value: ({ event }) => event.value,
-                shouldSave: () => false,
-              }),
-              reenter: true, // 입력이 계속되면 상태를 다시 시작
-            },
-          },
-          after: {
-            500: [
-              {
-                target: 'idle',
-                guard: 'hasChanges', // 변경 사항이 있을 경우
-                actions: [
-                  assign({
-                    value: ({ context }) => context.value,
-                    shouldSave: () => true, // 저장 플래그 설정
-                  }),
-                ],
-              },
-              {
-                target: 'idle', // 변경 사항이 없으면 바로 idle 상태로 이동
-              },
-            ],
-          },
-        },
+      states: inputMachine.config.states,
+      onDone: {
+        actions: sendTo('saving', ({ context }) => ({
+          type: 'text.save',
+          value: context.value,
+        })),
       },
     },
-    // 웹소켓 연결 상태
     connection: {
       initial: 'disconnected',
-      states: {
-        disconnected: {
-          on: {
-            'text.focus': 'connecting', // 포커스를 받으면 연결 시도
-          },
-        },
-        connecting: {
-          invoke: {
-            src: 'connectWebSocket',
-            onDone: 'connected',
-            onError: {
-              target: 'error',
-              actions: assign({
-                error: ({ event }) => event.error.message,
-              }),
-            },
-          },
-        },
-        connected: {},
-        error: {
-          on: {
-            'text.focus': 'connecting', // 다시 포커스를 받으면 재시도
-          },
-        },
-      },
+      states: connectionMachine.config.states,
     },
     saving: {
       initial: 'idle',
-      states: {
-        idle: {
-          always: {
-            target: 'saving',
-            guard: 'shouldSaveChanges', // 저장 플래그가 설정되어 있으면 저장 상태로 이동
-          },
-        },
-        saving: {
-          entry: assign({ shouldSave: () => false }), // 저장 후 플래그 초기화
-          invoke: {
-            src: 'saveText',
-            input: ({ context }) => ({
-              text: context.value, // 현재 입력 값을 저장
-            }),
-            onDone: {
-              target: 'idle',
-              actions: assign({
-                committedValue: ({ event }) => event.output, // 저장된 값 업데이트
-                error: () => undefined, // 오류 초기화
-              }),
-            },
-            onError: {
-              target: 'error',
-              actions: assign({
-                error: ({ event }) => event.error.message, // 오류 메시지 저장
-              }),
-            },
-          },
-        },
-        error: {
-          on: {
-            'text.retry': 'saving', // 재시도하면 다시 저장 시도
-          },
-        },
-      },
+      states: savingMachine.config.states,
     },
   },
 });
